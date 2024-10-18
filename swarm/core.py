@@ -1,292 +1,169 @@
-# Standard library imports
-import copy
-import json
-from collections import defaultdict
-from typing import List, Callable, Union
+```python
+     import openai
+     import os
+     import requests
+     from dotenv import load_dotenv
+     import json
+     import time
+     import shutil
+     import yaml
 
-# Package/library imports
-from openai import OpenAI
+     # Load environment variables from .env file
+     load_dotenv()
 
+     # Keys for different services
+     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+     HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
 
-# Local imports
-from .util import function_to_json, debug_print, merge_chunk
-from .types import (
-    Agent,
-    AgentFunction,
-    ChatCompletionMessage,
-    ChatCompletionMessageToolCall,
-    Function,
-    Response,
-    Result,
-)
+     # Setting up API configuration
+     openai.api_key = OPENAI_API_KEY
 
-__CTX_VARS_NAME__ = "context_variables"
+     # Function to Read and Process Requirements
+     def read_and_process_requirements():
+         # Step 1: Read the requirements file
+         try:
+             with open("requirements.txt", "r", encoding='utf-8') as req_file:
+                 requirements = req_file.read()
+                 print("Requirements Loaded Successfully.")
+         except FileNotFoundError:
+             raise Exception("requirements.txt file not found.")
 
+         # Step 2: Use ChatGPT 3.5 to understand and gather information from requirements
+         prompt = f"Interpret the following requirements for a codebase: \n{requirements}"
+         try:
+             response = openai.ChatCompletion.create(
+                 model="gpt-3.5-turbo",
+                 messages=[{"role": "user", "content": prompt}],
+                 max_tokens=1000,
+                 temperature=0.5
+             )
+             refined_requirements = response.choices[0].message['content'].strip()
+             print("Requirements Processed with ChatGPT 3.5.")
+         except Exception as e:
+             raise Exception(f"Error while using ChatGPT: {str(e)}")
 
-class Swarm:
-    def __init__(self, client=None):
-        if not client:
-            client = OpenAI()
-        self.client = client
+         return refined_requirements
 
-    def get_chat_completion(
-        self,
-        agent: Agent,
-        history: List,
-        context_variables: dict,
-        model_override: str,
-        stream: bool,
-        debug: bool,
-    ) -> ChatCompletionMessage:
-        context_variables = defaultdict(str, context_variables)
-        instructions = (
-            agent.instructions(context_variables)
-            if callable(agent.instructions)
-            else agent.instructions
-        )
-        messages = [{"role": "system", "content": instructions}] + history
-        debug_print(debug, "Getting chat completion for...:", messages)
+     # Function to Cross-Reference Project Index
+     def cross_reference_index(refined_requirements):
+         # Step 3: Read memgpt_index.md to gather context
+         try:
+             with open("memgpt_index.md", "r", encoding='utf-8') as index_file:
+                 index_data = index_file.read()
+                 print("Index Loaded Successfully.")
+         except FileNotFoundError:
+             raise Exception("memgpt_index.md file not found.")
 
-        tools = [function_to_json(f) for f in agent.functions]
-        # hide context_variables from model
-        for tool in tools:
-            params = tool["function"]["parameters"]
-            params["properties"].pop(__CTX_VARS_NAME__, None)
-            if __CTX_VARS_NAME__ in params["required"]:
-                params["required"].remove(__CTX_VARS_NAME__)
+         # Step 4: Combine requirements and index data
+         prompt = (
+             f"Based on the following requirements and project index, prepare a structured request for code transformation:\n"
+             f"Requirements:\n{refined_requirements}\n\nProject Index:\n{index_data}"
+         )
+         try:
+             response = openai.ChatCompletion.create(
+                 model="gpt-3.5-turbo",
+                 messages=[{"role": "user", "content": prompt}],
+                 max_tokens=1500,
+                 temperature=0.5
+             )
+             structured_request = response.choices[0].message['content'].strip()
+             print("Project Index Cross-Referenced and Structured Request Prepared.")
+         except Exception as e:
+             raise Exception(f"Error while preparing structured request: {str(e)}")
 
-        create_params = {
-            "model": model_override or agent.model,
-            "messages": messages,
-            "tools": tools or None,
-            "tool_choice": agent.tool_choice,
-            "stream": stream,
-        }
+         return structured_request
 
-        if tools:
-            create_params["parallel_tool_calls"] = agent.parallel_tool_calls
+     # Function to Call Hugging Face DeepSeek API
+     def send_to_deepseek(structured_request):
+         # Step 5: Set up the DeepSeek API endpoint and headers
+         api_endpoint = "https://api-inference.huggingface.co/models/deepseek-ai/deepseek-model"
+         headers = {
+             "Authorization": f"Bearer {HUGGINGFACE_API_KEY}",
+             "Content-Type": "application/json"
+         }
+         payload = {
+             "inputs": structured_request
+         }
 
-        return self.client.chat.completions.create(**create_params)
+         # Step 6: Send the request to Hugging Face DeepSeek API
+         for _ in range(3):  # Retry logic for up to 3 attempts
+             try:
+                 response = requests.post(api_endpoint, headers=headers, data=json.dumps(payload))
+                 response.raise_for_status()  # Raise an error for bad responses
+                 deepseek_result = response.json()
+                 print("Request Sent to Hugging Face DeepSeek Successfully.")
+                 break
+             except requests.exceptions.RequestException as e:
+                 print(f"Attempt failed with error: {str(e)}. Retrying...")
+                 time.sleep(10)  # Adjust the sleep time as necessary
+         else:
+             raise Exception("Failed to send request to DeepSeek after multiple attempts.")
 
-    def handle_function_result(self, result, debug) -> Result:
-        match result:
-            case Result() as result:
-                return result
+         # Step 7: Extract the transformed code from the API response
+         transformed_code = deepseek_result.get("generated_code", "")  # Assuming the correct field is "generated_code"
+         if not transformed_code:
+             raise Exception("DeepSeek returned no transformed code.")
 
-            case Agent() as agent:
-                return Result(
-                    value=json.dumps({"assistant": agent.name}),
-                    agent=agent,
-                )
-            case _:
-                try:
-                    return Result(value=str(result))
-                except Exception as e:
-                    error_message = f"Failed to cast response to string: {result}. Make sure agent functions return a string or Result object. Error: {str(e)}"
-                    debug_print(debug, error_message)
-                    raise TypeError(error_message)
+         return transformed_code
 
-    def handle_tool_calls(
-        self,
-        tool_calls: List[ChatCompletionMessageToolCall],
-        functions: List[AgentFunction],
-        context_variables: dict,
-        debug: bool,
-    ) -> Response:
-        function_map = {f.__name__: f for f in functions}
-        partial_response = Response(
-            messages=[], agent=None, context_variables={})
+     # Function to Save Transformed Code
+     def save_transformed_code(transformed_code):
+         # Step 8: Save the transformed code to a file for further review
+         backup_file = "transformed_code_output_backup.py"
+         output_file_path = "transformed_code_output.py"
+         try:
+             # Create a backup of the existing file if it exists
+             if os.path.exists(output_file_path):
+                 shutil.copy(output_file_path, backup_file)
+                 print("Backup of existing transformed code created successfully.")
+             with open(output_file_path, "w", encoding='utf-8') as output_file:
+                 output_file.write(transformed_code)
+                 print("Transformed Code Saved Successfully.")
+         except IOError as e:
+             raise IOError(f"Error saving transformed code: {str(e)}")
 
-        for tool_call in tool_calls:
-            name = tool_call.function.name
-            # handle missing tool case, skip to next tool
-            if name not in function_map:
-                debug_print(debug, f"Tool {name} not found in function map.")
-                partial_response.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "tool_name": name,
-                        "content": f"Error: Tool {name} not found.",
-                    }
-                )
-                continue
-            args = json.loads(tool_call.function.arguments)
-            debug_print(
-                debug, f"Processing tool call: {name} with arguments {args}")
+     # Function to Load Swarm Configuration
+     def load_swarm_config(config_file):
+         with open(config_file, "r") as file:
+             config = yaml.safe_load(file)
+         return config
 
-            func = function_map[name]
-            # pass context_variables to agent functions
-            if __CTX_VARS_NAME__ in func.__code__.co_varnames:
-                args[__CTX_VARS_NAME__] = context_variables
-            raw_result = function_map[name](**args)
+     # Function to Trigger Next Agent in Swarm Workflow
+     def trigger_next_agent(agent_name, input_data):
+         # Call the Swarm framework API to trigger the next agent
+         response = requests.post(f"http://swarm-framework/trigger/{agent_name}", json=input_data)
+         response.raise_for_status()
+         return response.json()
 
-            result: Result = self.handle_function_result(raw_result, debug)
-            partial_response.messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "tool_name": name,
-                    "content": result.value,
-                }
-            )
-            partial_response.context_variables.update(result.context_variables)
-            if result.agent:
-                partial_response.agent = result.agent
+     # Main Function to Execute Workflow
+     def main():
+         print("Starting MemGPT Gathering Workflow...\n")
+         try:
+             # Load Swarm Configuration
+             swarm_config = load_swarm_config("../swarm_config.yaml")  # Update the path to the root directory
 
-        return partial_response
+             # Step 1: Read and process requirements
+             refined_requirements = read_and_process_requirements()
 
-    def run_and_stream(
-        self,
-        agent: Agent,
-        messages: List,
-        context_variables: dict = {},
-        model_override: str = None,
-        debug: bool = False,
-        max_turns: int = float("inf"),
-        execute_tools: bool = True,
-    ):
-        active_agent = agent
-        context_variables = copy.deepcopy(context_variables)
-        history = copy.deepcopy(messages)
-        init_len = len(messages)
+             # Trigger the next agent in the Swarm workflow
+             trigger_next_agent(swarm_config["agents"][1]["name"], refined_requirements)
 
-        while len(history) - init_len < max_turns:
+             # Step 2: Cross-reference project index and prepare request
+             structured_request = cross_reference_index(refined_requirements)
 
-            message = {
-                "content": "",
-                "sender": agent.name,
-                "role": "assistant",
-                "function_call": None,
-                "tool_calls": defaultdict(
-                    lambda: {
-                        "function": {"arguments": "", "name": ""},
-                        "id": "",
-                        "type": "",
-                    }
-                ),
-            }
+             # Trigger the next agent in the Swarm workflow
+             trigger_next_agent(swarm_config["agents"][2]["name"], structured_request)
 
-            # get completion with current history, agent
-            completion = self.get_chat_completion(
-                agent=active_agent,
-                history=history,
-                context_variables=context_variables,
-                model_override=model_override,
-                stream=True,
-                debug=debug,
-            )
+             # Step 3: Send request to Hugging Face DeepSeek for transformation
+             transformed_code = send_to_deepseek(structured_request)
 
-            yield {"delim": "start"}
-            for chunk in completion:
-                delta = json.loads(chunk.choices[0].delta.json())
-                if delta["role"] == "assistant":
-                    delta["sender"] = active_agent.name
-                yield delta
-                delta.pop("role", None)
-                delta.pop("sender", None)
-                merge_chunk(message, delta)
-            yield {"delim": "end"}
+             # Step 4: Save transformed code
+             save_transformed_code(transformed_code)
 
-            message["tool_calls"] = list(
-                message.get("tool_calls", {}).values())
-            if not message["tool_calls"]:
-                message["tool_calls"] = None
-            debug_print(debug, "Received completion:", message)
-            history.append(message)
+             print("\nWorkflow Completed Successfully.")
+         except Exception as e:
+             print(f"Error: {str(e)}")
 
-            if not message["tool_calls"] or not execute_tools:
-                debug_print(debug, "Ending turn.")
-                break
-
-            # convert tool_calls to objects
-            tool_calls = []
-            for tool_call in message["tool_calls"]:
-                function = Function(
-                    arguments=tool_call["function"]["arguments"],
-                    name=tool_call["function"]["name"],
-                )
-                tool_call_object = ChatCompletionMessageToolCall(
-                    id=tool_call["id"], function=function, type=tool_call["type"]
-                )
-                tool_calls.append(tool_call_object)
-
-            # handle function calls, updating context_variables, and switching agents
-            partial_response = self.handle_tool_calls(
-                tool_calls, active_agent.functions, context_variables, debug
-            )
-            history.extend(partial_response.messages)
-            context_variables.update(partial_response.context_variables)
-            if partial_response.agent:
-                active_agent = partial_response.agent
-
-        yield {
-            "response": Response(
-                messages=history[init_len:],
-                agent=active_agent,
-                context_variables=context_variables,
-            )
-        }
-
-    def run(
-        self,
-        agent: Agent,
-        messages: List,
-        context_variables: dict = {},
-        model_override: str = None,
-        stream: bool = False,
-        debug: bool = False,
-        max_turns: int = float("inf"),
-        execute_tools: bool = True,
-    ) -> Response:
-        if stream:
-            return self.run_and_stream(
-                agent=agent,
-                messages=messages,
-                context_variables=context_variables,
-                model_override=model_override,
-                debug=debug,
-                max_turns=max_turns,
-                execute_tools=execute_tools,
-            )
-        active_agent = agent
-        context_variables = copy.deepcopy(context_variables)
-        history = copy.deepcopy(messages)
-        init_len = len(messages)
-
-        while len(history) - init_len < max_turns and active_agent:
-
-            # get completion with current history, agent
-            completion = self.get_chat_completion(
-                agent=active_agent,
-                history=history,
-                context_variables=context_variables,
-                model_override=model_override,
-                stream=stream,
-                debug=debug,
-            )
-            message = completion.choices[0].message
-            debug_print(debug, "Received completion:", message)
-            message.sender = active_agent.name
-            history.append(
-                json.loads(message.model_dump_json())
-            )  # to avoid OpenAI types (?)
-
-            if not message.tool_calls or not execute_tools:
-                debug_print(debug, "Ending turn.")
-                break
-
-            # handle function calls, updating context_variables, and switching agents
-            partial_response = self.handle_tool_calls(
-                message.tool_calls, active_agent.functions, context_variables, debug
-            )
-            history.extend(partial_response.messages)
-            context_variables.update(partial_response.context_variables)
-            if partial_response.agent:
-                active_agent = partial_response.agent
-
-        return Response(
-            messages=history[init_len:],
-            agent=active_agent,
-            context_variables=context_variables,
-        )
+     if __name__ == "__main__":
+         main()
+     ```
